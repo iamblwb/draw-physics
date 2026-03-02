@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Physics Draw — draw.iamblwb.com</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    overflow: hidden;
+    font-family: 'SF Pro Display', -apple-system, sans-serif;
+    touch-action: none;
+  }
+  canvas { display: block; }
+  #overlay-canvas {
+    position: fixed; top: 0; left: 0;
+    pointer-events: none; z-index: 10;
+  }
+  #ui {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 12px; align-items: center; z-index: 20;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 20px; padding: 10px 20px;
+    backdrop-filter: blur(20px);
+  }
+  .hint {
+    color: rgba(255,255,255,0.4);
+    font-size: 12px; letter-spacing: 0.5px;
+  }
+  .key {
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 6px; padding: 2px 8px;
+    color: rgba(255,255,255,0.7);
+    font-size: 11px; font-weight: 600;
+  }
+  #grav-indicator {
+    position: fixed; top: 20px; right: 20px;
+    color: rgba(255,255,255,0.3); font-size: 24px;
+    transition: transform 0.3s ease;
+    z-index: 20;
+  }
+  #shape-hint {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.5); font-size: 13px;
+    background: rgba(0,0,0,0.4); border-radius: 20px;
+    padding: 6px 16px; z-index: 20;
+    opacity: 0; transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  #particle-canvas {
+    position: fixed; top: 0; left: 0;
+    pointer-events: none; z-index: 5;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="physics-canvas"></canvas>
+<canvas id="particle-canvas"></canvas>
+<canvas id="overlay-canvas"></canvas>
+
+<div id="grav-indicator">↓</div>
+<div id="shape-hint" id="shape-hint"></div>
+<div id="ui">
+  <span class="key">R</span><span class="hint">清除</span>
+  <span style="color:rgba(255,255,255,0.15)">|</span>
+  <span class="key">Space</span><span class="hint">翻轉重力</span>
+  <span style="color:rgba(255,255,255,0.15)">|</span>
+  <span class="hint">畫圓→球 直線→棍 曲線→繩</span>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+(function() {
+'use strict';
+
+// ─── Engine Setup ────────────────────────────────────────────────
+const { Engine, Render, Runner, Bodies, Body, World, Events,
+        Constraint, Composite, Mouse, Vector, Query } = Matter;
+
+const W = window.innerWidth, H = window.innerHeight;
+
+// Physics canvas (Matter.js renders here)
+const physCanvas = document.getElementById('physics-canvas');
+physCanvas.width = W; physCanvas.height = H;
+
+// Particle canvas
+const partCanvas = document.getElementById('particle-canvas');
+partCanvas.width = W; partCanvas.height = H;
+const partCtx = partCanvas.getContext('2d');
+
+// Drawing overlay canvas
+const overlayCanvas = document.getElementById('overlay-canvas');
+overlayCanvas.width = W; overlayCanvas.height = H;
+const overlayCtx = overlayCanvas.getContext('2d');
+
+const engine = Engine.create({ gravity: { x: 0, y: 1.5 } });
+const world = engine.world;
+
+// Custom renderer (we draw everything ourselves for glow effects)
+const ctx = physCanvas.getContext('2d');
+
+// ─── Walls ───────────────────────────────────────────────────────
+const wallOpts = { isStatic: true, friction: 0.8, restitution: 0.3, label: 'wall' };
+const ground  = Bodies.rectangle(W/2, H+25, W*2, 50, wallOpts);
+const wallL   = Bodies.rectangle(-25, H/2, 50, H*2, wallOpts);
+const wallR   = Bodies.rectangle(W+25, H/2, 50, H*2, wallOpts);
+const ceiling = Bodies.rectangle(W/2, -25, W*2, 50, wallOpts);
+World.add(world, [ground, wallL, wallR, ceiling]);
+
+// ─── Visual Bodies storage ────────────────────────────────────────
+const visualBodies = []; // { body, color, type, points? }
+const particles = [];
+const constraints = [];
+
+// ─── Color palette ───────────────────────────────────────────────
+const COLORS = [
+  '#00f5ff','#7c3aed','#ec4899','#f59e0b',
+  '#10b981','#ef4444','#3b82f6','#a855f7'
+];
+let colorIdx = 0;
+function nextColor() {
+  return COLORS[colorIdx++ % COLORS.length];
+}
+
+// ─── Shape Detection ─────────────────────────────────────────────
+function analyzeStroke(pts) {
+  if (pts.length < 3) return 'dot';
+
+  // Bounding box
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  const bw = maxX - minX, bh = maxY - minY;
+  const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+
+  // Circle check: start ≈ end, aspect ratio close to 1
+  const firstP = pts[0], lastP = pts[pts.length-1];
+  const closedDist = Math.hypot(lastP.x-firstP.x, lastP.y-firstP.y);
+  const perimeter = pts.reduce((sum,p,i) => i>0 ? sum+Math.hypot(p.x-pts[i-1].x,p.y-pts[i-1].y) : sum, 0);
+  const isCircle = closedDist < perimeter * 0.25 && Math.abs(bw-bh) < Math.max(bw,bh)*0.5;
+
+  if (isCircle) return 'circle';
+
+  // Line check: all points close to the line connecting first and last
+  const dx = lastP.x-firstP.x, dy = lastP.y-firstP.y;
+  const len = Math.hypot(dx,dy);
+  if (len < 5) return 'dot';
+
+  let maxDev = 0;
+  for (const p of pts) {
+    const t = ((p.x-firstP.x)*dx + (p.y-firstP.y)*dy) / (len*len);
+    const projX = firstP.x + t*dx, projY = firstP.y + t*dy;
+    maxDev = Math.max(maxDev, Math.hypot(p.x-projX, p.y-projY));
+  }
+  if (maxDev < len * 0.15) return 'line';
+
+  return 'curve';
+}
+
+// ─── Create physics bodies ────────────────────────────────────────
+function createFromStroke(pts, color) {
+  const type = analyzeStroke(pts);
+  showShapeHint(type);
+
+  if (type === 'dot' || pts.length < 2) return;
+
+  let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+  for (const p of pts) {
+    minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x);
+    minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y);
+  }
+  const cx=(minX+maxX)/2, cy=(minY+maxY)/2;
+  const bw=maxX-minX, bh=maxY-minY;
+
+  if (type === 'circle') {
+    const r = (Math.max(bw,bh)/2) * 0.85;
+    const body = Bodies.circle(cx, cy, Math.max(r,15), {
+      restitution: 0.5, friction: 0.3, frictionAir: 0.005, density: 0.002,
+      label: 'circle'
+    });
+    World.add(world, body);
+    visualBodies.push({ body, color, type: 'circle', r: Math.max(r,15) });
+    spawnParticles(cx, cy, color, 20);
+  }
+
+  else if (type === 'line') {
+    const firstP = pts[0], lastP = pts[pts.length-1];
+    const len = Math.max(Math.hypot(lastP.x-firstP.x, lastP.y-firstP.y), 20);
+    const angle = Math.atan2(lastP.y-firstP.y, lastP.x-firstP.x);
+    const body = Bodies.rectangle(cx, cy, len, 8, {
+      restitution: 0.3, friction: 0.6, frictionAir: 0.008, density: 0.003,
+      angle, label: 'line'
+    });
+    World.add(world, body);
+    visualBodies.push({ body, color, type: 'line', len });
+    spawnParticles(cx, cy, color, 15);
+  }
+
+  else { // curve → rope
+    const SEGS = Math.min(Math.max(Math.floor(pts.length / 4), 5), 18);
+    const step = Math.floor(pts.length / SEGS);
+    const segPts = [];
+    for (let i = 0; i < SEGS; i++) {
+      segPts.push(pts[Math.min(i*step, pts.length-1)]);
+    }
+
+    const segBodies = [];
+    const segLen = segPts.reduce((sum,p,i) =>
+      i>0 ? sum+Math.hypot(p.x-segPts[i-1].x, p.y-segPts[i-1].y) : sum, 0) / (SEGS-1);
+    const segW = Math.max(segLen*0.9, 10);
+
+    for (let i = 0; i < segPts.length-1; i++) {
+      const a = segPts[i], b = segPts[i+1];
+      const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+      const angle = Math.atan2(b.y-a.y, b.x-a.x);
+      const segL = Math.max(Math.hypot(b.x-a.x,b.y-a.y), 8);
+      const body = Bodies.rectangle(mx, my, segL, 6, {
+        restitution: 0.1, friction: 0.4, frictionAir: 0.01,
+        density: 0.001, angle, label: 'rope-seg',
+        collisionFilter: { category: 0x0002, mask: 0x0001 }
+      });
+      segBodies.push(body);
+      World.add(world, body);
+      visualBodies.push({ body, color, type: 'rope-seg', segL });
+    }
+
+    // Chain them together
+    for (let i = 0; i < segBodies.length-1; i++) {
+      const a = segBodies[i], b = segBodies[i+1];
+      const c = Constraint.create({
+        bodyA: a, bodyB: b,
+        pointA: { x: a.bounds.max.x - a.position.x, y: 0 },
+        pointB: { x: b.bounds.min.x - b.position.x, y: 0 },
+        stiffness: 0.8, damping: 0.1, length: 0
+      });
+      World.add(world, c);
+      constraints.push({ c, colorA: color, colorB: color });
+    }
+    spawnParticles(cx, cy, color, 10);
+  }
+}
+
+// ─── Particle System ─────────────────────────────────────────────
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle)*speed,
+      vy: Math.sin(angle)*speed - 2,
+      life: 1.0,
+      decay: 0.02 + Math.random()*0.03,
+      size: 2 + Math.random()*4,
+      color
+    });
+  }
+}
+
+function updateParticles() {
+  partCtx.clearRect(0, 0, W, H);
+  for (let i = particles.length-1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.1; // gravity on particles
+    p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i,1); continue; }
+
+    partCtx.globalAlpha = p.life;
+    partCtx.fillStyle = p.color;
+    partCtx.shadowBlur = 8;
+    partCtx.shadowColor = p.color;
+    partCtx.beginPath();
+    partCtx.arc(p.x, p.y, p.size*p.life, 0, Math.PI*2);
+    partCtx.fill();
+  }
+  partCtx.globalAlpha = 1;
+  partCtx.shadowBlur = 0;
+}
+
+// ─── Shape Hint ──────────────────────────────────────────────────
+const shapeHintEl = document.getElementById('shape-hint');
+let hintTimer;
+function showShapeHint(type) {
+  const map = { circle: '⭕ 球體', line: '📏 棍子', curve: '🌊 繩索' };
+  shapeHintEl.textContent = map[type] || '';
+  shapeHintEl.style.opacity = '1';
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { shapeHintEl.style.opacity = '0'; }, 1500);
+}
+
+// ─── Drawing Input ───────────────────────────────────────────────
+let drawing = false;
+let strokePoints = [];
+let currentColor = nextColor();
+
+function getPos(e) {
+  if (e.touches) {
+    return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }
+  return { x: e.clientX, y: e.clientY };
+}
+
+function onStart(e) {
+  e.preventDefault();
+  drawing = true;
+  strokePoints = [];
+  currentColor = nextColor();
+  const p = getPos(e);
+  strokePoints.push(p);
+}
+
+function onMove(e) {
+  e.preventDefault();
+  if (!drawing) return;
+  const p = getPos(e);
+  const last = strokePoints[strokePoints.length-1];
+  if (Math.hypot(p.x-last.x, p.y-last.y) > 3) {
+    strokePoints.push(p);
+    drawOverlay();
+  }
+}
+
+function onEnd(e) {
+  e.preventDefault();
+  if (!drawing) return;
+  drawing = false;
+  // Clear overlay
+  overlayCtx.clearRect(0, 0, W, H);
+  if (strokePoints.length >= 2) {
+    createFromStroke(strokePoints, currentColor);
+  }
+  strokePoints = [];
+}
+
+function drawOverlay() {
+  overlayCtx.clearRect(0, 0, W, H);
+  if (strokePoints.length < 2) return;
+
+  overlayCtx.save();
+  overlayCtx.strokeStyle = currentColor;
+  overlayCtx.lineWidth = 3;
+  overlayCtx.lineCap = 'round';
+  overlayCtx.lineJoin = 'round';
+  overlayCtx.shadowBlur = 20;
+  overlayCtx.shadowColor = currentColor;
+
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(strokePoints[0].x, strokePoints[0].y);
+  for (let i = 1; i < strokePoints.length; i++) {
+    overlayCtx.lineTo(strokePoints[i].x, strokePoints[i].y);
+  }
+  overlayCtx.stroke();
+
+  // Second pass for stronger glow
+  overlayCtx.globalAlpha = 0.4;
+  overlayCtx.lineWidth = 8;
+  overlayCtx.shadowBlur = 40;
+  overlayCtx.stroke();
+  overlayCtx.restore();
+}
+
+// Event listeners
+physCanvas.addEventListener('mousedown', onStart);
+physCanvas.addEventListener('mousemove', onMove);
+physCanvas.addEventListener('mouseup', onEnd);
+physCanvas.addEventListener('touchstart', onStart, { passive: false });
+physCanvas.addEventListener('touchmove', onMove, { passive: false });
+physCanvas.addEventListener('touchend', onEnd, { passive: false });
+
+// ─── Keyboard ────────────────────────────────────────────────────
+let gravityDir = 1; // 1=down, -1=up, 0=left, 2=right
+const gravRotations = [
+  { x:0,   y:1.5,  label:'↓', deg: 0 },
+  { x:0,   y:-1.5, label:'↑', deg: 180 },
+  { x:-1.5,y:0,    label:'←', deg: 90 },
+  { x:1.5, y:0,    label:'→', deg: 270 }
+];
+let gravStep = 0;
+const gravIndicator = document.getElementById('grav-indicator');
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    gravStep = (gravStep+1) % gravRotations.length;
+    const g = gravRotations[gravStep];
+    engine.world.gravity.x = g.x;
+    engine.world.gravity.y = g.y;
+    gravIndicator.textContent = g.label;
+    // Kick all bodies
+    for (const vb of visualBodies) {
+      Body.applyForce(vb.body, vb.body.position,
+        { x: (Math.random()-0.5)*0.05, y: (Math.random()-0.5)*0.05 });
+    }
+  }
+  if (e.code === 'KeyR') {
+    clearAll();
+  }
+});
+
+function clearAll() {
+  for (const vb of visualBodies) {
+    World.remove(world, vb.body);
+  }
+  visualBodies.length = 0;
+  for (const { c } of constraints) {
+    World.remove(world, c);
+  }
+  constraints.length = 0;
+  particles.length = 0;
+  // Burst particles
+  for (let i=0; i<40; i++) {
+    spawnParticles(Math.random()*W, Math.random()*H,
+      COLORS[Math.floor(Math.random()*COLORS.length)], 1);
+  }
+}
+
+// ─── Main Render Loop ────────────────────────────────────────────
+function drawGlowBody(body, color, type, extra) {
+  const pos = body.position;
+  const angle = body.angle;
+
+  ctx.save();
+  ctx.translate(pos.x, pos.y);
+  ctx.rotate(angle);
+
+  // Glow layers
+  const glows = [
+    { blur: 30, alpha: 0.15, width: 12 },
+    { blur: 15, alpha: 0.4,  width: 6  },
+    { blur: 0,  alpha: 1.0,  width: 3  },
+  ];
+
+  if (type === 'circle') {
+    const r = extra.r;
+    for (const g of glows) {
+      ctx.shadowBlur = g.blur;
+      ctx.shadowColor = color;
+      ctx.globalAlpha = g.alpha;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = g.width;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI*2);
+      ctx.stroke();
+    }
+    // Inner subtle fill
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI*2);
+    ctx.fill();
+
+  } else if (type === 'line' || type === 'rope-seg') {
+    const hw = (extra.len || extra.segL) / 2;
+    for (const g of glows) {
+      ctx.shadowBlur = g.blur;
+      ctx.shadowColor = color;
+      ctx.globalAlpha = g.alpha;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = g.width;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-hw, 0);
+      ctx.lineTo(hw, 0);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
+// Trail effect – semi-transparent overlay each frame
+let frameCount = 0;
+
+function render() {
+  // Subtle motion blur / fade
+  ctx.globalAlpha = 0.18;
+  ctx.fillStyle = '#0a0a0f';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 1;
+
+  // Draw all bodies
+  for (const vb of visualBodies) {
+    drawGlowBody(vb.body, vb.color, vb.type, vb);
+  }
+
+  // Draw constraints as glowing lines
+  for (const { c, colorA } of constraints) {
+    if (!c.bodyA || !c.bodyB) continue;
+    const pA = c.bodyA.position;
+    const pB = c.bodyB.position;
+    ctx.save();
+    ctx.strokeStyle = colorA;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = colorA;
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(pA.x, pA.y);
+    ctx.lineTo(pB.x, pB.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  frameCount++;
+}
+
+// ─── Run ──────────────────────────────────────────────────────────
+// Initial dark background
+ctx.fillStyle = '#0a0a0f';
+ctx.fillRect(0, 0, W, H);
+
+const runner = Runner.create();
+
+// Use requestAnimationFrame for smooth render
+function loop() {
+  Runner.tick(runner, engine, 1000/60);
+  render();
+  updateParticles();
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ─── Resize ───────────────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  // Reposition walls
+  Body.setPosition(ground,  { x: window.innerWidth/2,   y: window.innerHeight+25 });
+  Body.setPosition(ceiling, { x: window.innerWidth/2,   y: -25 });
+  Body.setPosition(wallR,   { x: window.innerWidth+25,  y: window.innerHeight/2 });
+});
+
+// ─── Welcome particles ────────────────────────────────────────────
+setTimeout(() => {
+  for (let i=0; i<6; i++) {
+    spawnParticles(
+      W*0.2 + Math.random()*W*0.6,
+      H*0.3 + Math.random()*H*0.3,
+      COLORS[i % COLORS.length], 12
+    );
+  }
+}, 500);
+
+})();
+</script>
+</body>
+</html>
